@@ -63,6 +63,20 @@ app.post("/seller-products", async (req, res) => {
     }
 });
 
+app.get("/seller-products", async (_req, res) => {
+    try {
+        const products = await sellerProducts
+            .find({})
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        return res.status(200).json({ products });
+    } catch (err) {
+        console.error("Failed to fetch products:", err);
+        return res.status(500).json({ message: "Failed to fetch products." });
+    }
+});
+
 app.get("/seller-products/:sellerId", async (req, res) => {
     const sellerId = req.params.sellerId?.trim();
 
