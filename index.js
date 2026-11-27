@@ -26,6 +26,7 @@ const connectedClient = await connectToMongoDB();
 const database = connectedClient.db("frostfit");
 const users = database.collection("user");
 const sellerProducts = database.collection("sellerProducts");
+const customerOrders = database.collection("customerOrders");
 
 
 
@@ -157,6 +158,206 @@ app.patch("/seller-products/:productId", async (req, res) => {
     } catch (err) {
         console.error("Failed to update seller product:", err);
         return res.status(500).json({ message: "Failed to update seller product." });
+    }
+});
+
+// GET /api/orders - Get all customer orders for the authenticated customer
+app.get("/api/orders", async (req, res) => {
+    const customerId = req.headers["x-customer-id"];
+    if (!customerId || typeof customerId !== "string") {
+        return res.status(401).json({ message: "Customer ID required." });
+    }
+
+    try {
+        const orders = await customerOrders
+            .find({ customerId })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+        return res.status(200).json({
+            orders: orders.map((order) => ({
+                ...order,
+                _id: String(order._id),
+            })),
+        });
+    } catch (err) {
+        console.error("Failed to fetch orders:", err);
+        return res.status(500).json({ message: "Failed to load orders." });
+    }
+});
+
+// POST /api/orders - Create a new order
+app.post("/api/orders", async (req, res) => {
+    const customerId = req.headers["x-customer-id"];
+    if (!customerId || typeof customerId !== "string") {
+        return res.status(401).json({ message: "Customer ID required." });
+    }
+
+    const body = req.body ?? {};
+
+    const {
+        items,
+        shippingAddress,
+        paymentMethod,
+    } = body;
+
+    if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ message: "Items are required." });
+    }
+
+    if (!shippingAddress || typeof shippingAddress !== "object") {
+        return res.status(400).json({ message: "Shipping address is required." });
+    }
+
+    const allowedPayments = new Set(["cod", "bkash", "nagad", "card"]);
+    if (typeof paymentMethod !== "string" || !allowedPayments.has(paymentMethod.trim())) {
+        return res.status(400).json({ message: "Valid payment method is required." });
+    }
+
+    const requiredFields = ["fullName", "phone", "address", "city"];
+    for (const field of requiredFields) {
+        if (
+            typeof shippingAddress[field] !== "string" ||
+            !shippingAddress[field].trim()
+        ) {
+            return res.status(400).json({ message: `${field} is required.` });
+        }
+    }
+
+    const orderItems = items.map((item) => ({
+        productId: item.productId || "",
+        name: item.name || "Product",
+        brand: item.brand || "FrostFit",
+        sku: item.sku || "",
+        thumbnail: item.thumbnail || "",
+        unitPrice: Number(item.unitPrice || 0),
+        size: item.size || "",
+        color: item.color || "",
+        quantity: Number(item.quantity || 1),
+    }));
+
+    const totalAmount = orderItems.reduce(
+        (sum, item) => sum + item.unitPrice * item.quantity,
+        0,
+    );
+
+    const now = new Date();
+    const newOrder = {
+        customerId,
+        customerName: shippingAddress.fullName.trim(),
+        customerEmail: shippingAddress.email || "",
+        items: orderItems,
+        shippingAddress: {
+            fullName: shippingAddress.fullName.trim(),
+            phone: shippingAddress.phone.trim(),
+            address: shippingAddress.address.trim(),
+            city: shippingAddress.city.trim(),
+            postalCode: shippingAddress.postalCode || "",
+            note: shippingAddress.note || "",
+        },
+        paymentMethod: paymentMethod.trim(),
+        totalAmount,
+        status: "pending",
+        createdAt: now,
+        updatedAt: now,
+    };
+
+    try {
+        const result = await customerOrders.insertOne(newOrder);
+        return res.status(201).json({
+            message: "Order placed successfully.",
+            order: { ...newOrder, _id: String(result.insertedId) },
+        });
+    } catch (err) {
+        console.error("Failed to place order:", err);
+        return res.status(500).json({ message: "Failed to place order." });
+    }
+});
+
+// PATCH /api/orders/:orderId - Cancel an order
+app.patch("/api/orders/:orderId", async (req, res) => {
+    const customerId = req.headers["x-customer-id"];
+    if (!customerId || typeof customerId !== "string") {
+        return res.status(401).json({ message: "Customer ID required." });
+    }
+
+    const orderId = req.params.orderId;
+    const body = req.body ?? {};
+    const status = typeof body.status === "string" ? body.status.trim() : "";
+
+    if (!ObjectId.isValid(orderId)) {
+        return res.status(400).json({ message: "A valid orderId is required." });
+    }
+
+    if (status !== "cancelled") {
+        return res.status(400).json({ message: "Only cancellation is supported." });
+    }
+
+    try {
+        const order = await customerOrders.findOne({
+            _id: new ObjectId(orderId),
+            customerId,
+        });
+
+        if (!order) {
+            return res.status(404).json({ message: "Order not found." });
+        }
+
+        const nonCancellableStatuses = new Set([
+            "delivered",
+            "cancelled",
+            "shipped",
+        ]);
+
+        if (nonCancellableStatuses.has(order.status)) {
+            return res.status(400).json({
+                message: `Orders with status "${order.status}" cannot be cancelled.`,
+            });
+        }
+
+        const result = await customerOrders.updateOne(
+            { _id: new ObjectId(orderId), customerId },
+            { $set: { status: "cancelled", updatedAt: new Date() } },
+        );
+
+        if (!result.modifiedCount) {
+            return res.status(400).json({ message: "Order could not be cancelled." });
+        }
+
+        return res.status(200).json({ message: "Order cancelled successfully." });
+    } catch (err) {
+        console.error("Failed to cancel order:", err);
+        return res.status(500).json({ message: "Failed to cancel order." });
+    }
+});
+
+// DELETE /api/orders/:orderId - Delete an order
+app.delete("/api/orders/:orderId", async (req, res) => {
+    const customerId = req.headers["x-customer-id"];
+    if (!customerId || typeof customerId !== "string") {
+        return res.status(401).json({ message: "Customer ID required." });
+    }
+
+    const orderId = req.params.orderId;
+
+    if (!ObjectId.isValid(orderId)) {
+        return res.status(400).json({ message: "A valid orderId is required." });
+    }
+
+    try {
+        const result = await customerOrders.deleteOne({
+            _id: new ObjectId(orderId),
+            customerId,
+        });
+
+        if (!result.deletedCount) {
+            return res.status(404).json({ message: "Order not found." });
+        }
+
+        return res.status(200).json({ message: "Order deleted successfully." });
+    } catch (err) {
+        console.error("Failed to delete order:", err);
+        return res.status(500).json({ message: "Failed to delete order." });
     }
 });
 
