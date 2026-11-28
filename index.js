@@ -40,6 +40,22 @@ function requireCustomerId(req, res, next) {
     return next();
 }
 
+async function requireAdminId(req, res, next) {
+    const adminId = req.get("x-admin-id")?.trim();
+    if (!adminId) return res.status(401).json({ message: "Admin ID required." });
+    try {
+        const identityOptions = [{ _id: adminId }, { id: adminId }];
+        if (ObjectId.isValid(adminId)) identityOptions.unshift({ _id: new ObjectId(adminId) });
+        const admin = await users.findOne({ $and: [{ $or: identityOptions }, { role: "admin" }] }, { projection: { _id: 1 } });
+        if (!admin) return res.status(403).json({ message: "Admin access required." });
+        req.adminId = adminId;
+        return next();
+    } catch (err) {
+        console.error("Failed to verify admin access:", err);
+        return res.status(500).json({ message: "Could not verify admin access." });
+    }
+}
+
 function normalizeAddress(body = {}) {
     return {
         fullName: typeof body.fullName === "string" ? body.fullName.trim() : "",
@@ -95,7 +111,8 @@ app.get("/products", async (req, res) => {
             baseFilter["details.season"] = { $regex: new RegExp(`^${escapeRegex(season)}$`, "i") };
         }
 
-        const queryFilter = { ...baseFilter };
+        const facetFilter = { status: "active", ...baseFilter };
+        const queryFilter = { ...facetFilter };
         if (q) {
             const pattern = new RegExp(escapeRegex(q), "i");
             queryFilter.$or = [
@@ -136,9 +153,9 @@ app.get("/products", async (req, res) => {
                 { $project: { _effectivePrice: 0 } },
             ]).toArray(),
             sellerProducts.countDocuments(queryFilter),
-            sellerProducts.distinct("details.season", baseFilter),
-            sellerProducts.distinct("details.gender", baseFilter),
-            sellerProducts.distinct("variants.size", baseFilter),
+            sellerProducts.distinct("details.season", facetFilter),
+            sellerProducts.distinct("details.gender", facetFilter),
+            sellerProducts.distinct("variants.size", facetFilter),
         ]);
         return res.status(200).json({
             products: products.map((product) => ({ ...product, _id: String(product._id) })),
@@ -348,6 +365,10 @@ app.post("/seller-products", async (req, res) => {
     const newProduct = {
         ...productDetails,
         sellerId: productDetails.sellerId.trim(),
+        status: "pending",
+        reviewReason: "",
+        reviewedBy: "",
+        reviewedAt: null,
         createdAt: new Date(),
     };
     delete newProduct._id;
@@ -367,7 +388,7 @@ app.post("/seller-products", async (req, res) => {
 app.get("/seller-products", async (_req, res) => {
     try {
         const products = await sellerProducts
-            .find({})
+            .find({ status: "active" })
             .sort({ createdAt: -1 })
             .toArray();
 
@@ -375,6 +396,50 @@ app.get("/seller-products", async (_req, res) => {
     } catch (err) {
         console.error("Failed to fetch products:", err);
         return res.status(500).json({ message: "Failed to fetch products." });
+    }
+});
+
+app.get("/admin/seller-products", requireAdminId, async (_req, res) => {
+    try {
+        const products = await sellerProducts.find({}).sort({ createdAt: -1 }).toArray();
+        return res.status(200).json({ products: products.map((product) => ({ ...product, _id: String(product._id) })) });
+    } catch (err) {
+        console.error("Failed to fetch admin catalog:", err);
+        return res.status(500).json({ message: "Failed to load the admin catalog." });
+    }
+});
+
+app.patch("/admin/seller-products/:productId/review", requireAdminId, async (req, res) => {
+    const { productId } = req.params;
+    const decision = typeof req.body?.decision === "string" ? req.body.decision.trim() : "";
+    const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+    if (!ObjectId.isValid(productId)) return res.status(400).json({ message: "A valid productId is required." });
+    if (!["approved", "rejected"].includes(decision)) return res.status(400).json({ message: "Decision must be approved or rejected." });
+    if (decision === "rejected" && (reason.length < 5 || reason.length > 500)) return res.status(400).json({ message: "Add a rejection reason between 5 and 500 characters." });
+
+    try {
+        const productIdObject = new ObjectId(productId);
+        const existing = await sellerProducts.findOne({ _id: productIdObject });
+        if (!existing) return res.status(404).json({ message: "Product not found." });
+        if (existing.status !== "pending") return res.status(409).json({ message: "Only pending products can be reviewed." });
+        const now = new Date();
+        const set = {
+            status: decision === "approved" ? "active" : "rejected",
+            reviewReason: decision === "rejected" ? reason : "",
+            reviewedBy: req.adminId,
+            reviewedAt: now,
+            updatedAt: now,
+        };
+        const result = await sellerProducts.findOneAndUpdate(
+            { _id: productIdObject, status: "pending" },
+            { $set: set },
+            { returnDocument: "after" },
+        );
+        if (!result) return res.status(409).json({ message: "This product has already been reviewed." });
+        return res.status(200).json({ message: decision === "approved" ? "Product approved." : "Product rejected.", product: { ...result, _id: String(result._id) } });
+    } catch (err) {
+        console.error("Failed to review product:", err);
+        return res.status(500).json({ message: "Failed to review product." });
     }
 });
 
@@ -429,7 +494,7 @@ app.delete("/seller-products/:productId", async (req, res) => {
 
 app.patch("/seller-products/:productId", async (req, res) => {
     const productId = req.params.productId;
-    const { sellerId, _id, createdAt, updatedAt, status, ...updates } = req.body ?? {};
+    const { sellerId } = req.body ?? {};
 
     if (!ObjectId.isValid(productId)) {
         return res.status(400).json({ message: "A valid productId is required." });
@@ -439,14 +504,27 @@ app.patch("/seller-products/:productId", async (req, res) => {
         return res.status(400).json({ message: "sellerId is required." });
     }
 
+    const updates = {};
+    if (typeof req.body?.name === "string") updates.name = req.body.name.trim();
+    if (typeof req.body?.description === "string") updates.description = req.body.description.trim();
+    if (req.body?.pricing && typeof req.body.pricing === "object" && !Array.isArray(req.body.pricing)) updates.pricing = req.body.pricing;
     if (!Object.keys(updates).length) {
         return res.status(400).json({ message: "Provide at least one product field to update." });
     }
 
     try {
+        const existing = await sellerProducts.findOne({ _id: new ObjectId(productId), sellerId: sellerId.trim() });
+        if (!existing) return res.status(404).json({ message: "Product not found." });
+        const setUpdates = { ...updates, updatedAt: new Date() };
+        if (existing.status === "rejected") {
+            setUpdates.status = "pending";
+            setUpdates.reviewReason = "";
+            setUpdates.reviewedBy = "";
+            setUpdates.reviewedAt = null;
+        }
         const result = await sellerProducts.findOneAndUpdate(
             { _id: new ObjectId(productId), sellerId: sellerId.trim() },
-            { $set: { ...updates, updatedAt: new Date() } },
+            { $set: setUpdates },
             { returnDocument: "after" },
         );
 
