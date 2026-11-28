@@ -25,6 +25,8 @@ export async function connectToMongoDB() {
 const connectedClient = await connectToMongoDB();
 const database = connectedClient.db("frostfit");
 const users = database.collection("user");
+const authSessions = database.collection("session");
+const authAccounts = database.collection("account");
 const sellerProducts = database.collection("sellerProducts");
 const customerOrders = database.collection("customerOrders");
 const productReviews = database.collection("productReviews");
@@ -440,6 +442,123 @@ app.patch("/admin/seller-products/:productId/review", requireAdminId, async (req
     } catch (err) {
         console.error("Failed to review product:", err);
         return res.status(500).json({ message: "Failed to review product." });
+    }
+});
+
+app.get("/admin/users", requireAdminId, async (_req, res) => {
+    try {
+        const accountUsers = await users.find({}).sort({ createdAt: -1 }).toArray();
+        return res.status(200).json({ users: accountUsers.map((user) => ({
+            id: String(user.id ?? user._id),
+            name: String(user.name ?? ""),
+            email: String(user.email ?? ""),
+            phone: String(user.phone ?? ""),
+            image: typeof user.image === "string" ? user.image : "",
+            role: String(user.role ?? "customer"),
+            emailVerified: user.emailVerified === true,
+            createdAt: user.createdAt ?? null,
+        })) });
+    } catch (err) {
+        console.error("Failed to fetch admin users:", err);
+        return res.status(500).json({ message: "Failed to load users." });
+    }
+});
+
+app.patch("/admin/users/:userId", requireAdminId, async (req, res) => {
+    const userId = req.params.userId?.trim();
+    const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+    const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+    const phone = typeof req.body?.phone === "string" ? req.body.phone.trim() : "";
+    const image = typeof req.body?.image === "string" ? req.body.image.trim() : "";
+    const role = typeof req.body?.role === "string" ? req.body.role.trim() : "";
+    if (!userId) return res.status(400).json({ message: "A valid userId is required." });
+    if (name.length < 2 || name.length > 100) return res.status(400).json({ message: "Name must be between 2 and 100 characters." });
+    if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ message: "Enter a valid email address." });
+    if (phone.length > 40) return res.status(400).json({ message: "Phone number must be 40 characters or less." });
+    if (image.length > 2000) return res.status(400).json({ message: "Profile image URL must be 2000 characters or less." });
+    if (!["customer", "seller", "admin"].includes(role)) return res.status(400).json({ message: "Role must be customer, seller, or admin." });
+
+    try {
+        const filter = profileUserFilter(userId);
+        const existing = await users.findOne(filter);
+        if (!existing) return res.status(404).json({ message: "User not found." });
+        const existingId = String(existing.id ?? existing._id);
+        const duplicateEmail = await users.findOne({ email });
+        if (duplicateEmail && String(duplicateEmail.id ?? duplicateEmail._id) !== existingId) {
+            return res.status(409).json({ message: "That email address is already used by another account." });
+        }
+        if (existing.role === "admin" && role !== "admin" && await users.countDocuments({ role: "admin" }) <= 1) {
+            return res.status(409).json({ message: "The last admin cannot be changed to another role." });
+        }
+
+        const emailChanged = existing.email !== email;
+        await users.updateOne(filter, { $set: {
+            name,
+            email,
+            phone,
+            image,
+            role,
+            ...(emailChanged ? { emailVerified: false } : {}),
+            updatedAt: new Date(),
+        } });
+        if (existing.role === "seller" && role !== "seller") {
+            await sellerProducts.updateMany(
+                { sellerId: existingId, status: "active" },
+                { $set: { status: "suspended", reviewReason: "Seller role changed by an administrator.", updatedAt: new Date() } },
+            );
+        }
+        if (existing.role !== role || emailChanged) await authSessions.deleteMany({ userId: existingId });
+        const updated = await users.findOne(filter);
+        if (!updated) return res.status(404).json({ message: "User not found." });
+        return res.status(200).json({ message: "User updated.", user: {
+            id: String(updated.id ?? updated._id),
+            name: String(updated.name ?? ""),
+            email: String(updated.email ?? ""),
+            phone: String(updated.phone ?? ""),
+            image: typeof updated.image === "string" ? updated.image : "",
+            role: String(updated.role ?? "customer"),
+            emailVerified: updated.emailVerified === true,
+            createdAt: updated.createdAt ?? null,
+        } });
+    } catch (err) {
+        console.error("Failed to update user:", err);
+        return res.status(500).json({ message: "Failed to update user." });
+    }
+});
+
+app.delete("/admin/users/:userId", requireAdminId, async (req, res) => {
+    const userId = req.params.userId?.trim();
+    if (!userId) return res.status(400).json({ message: "A valid userId is required." });
+    if (userId === req.adminId) return res.status(400).json({ message: "You cannot remove the account you are signed in with." });
+
+    try {
+        const filter = profileUserFilter(userId);
+        const target = await users.findOne(filter);
+        if (!target) return res.status(404).json({ message: "User not found." });
+        if (target.role === "admin" && await users.countDocuments({ role: "admin" }) <= 1) {
+            return res.status(409).json({ message: "The last admin account cannot be removed." });
+        }
+
+        const targetId = String(target.id ?? target._id);
+        if (target.role === "seller") {
+            await sellerProducts.updateMany(
+                { sellerId: targetId, status: "active" },
+                { $set: { status: "suspended", reviewReason: "Seller account removed by an administrator.", updatedAt: new Date() } },
+            );
+        }
+        await Promise.all([
+            authSessions.deleteMany({ userId: targetId }),
+            authAccounts.deleteMany({ userId: targetId }),
+            customerAddresses.deleteMany({ customerId: targetId }),
+            customerSavedItems.deleteMany({ userId: targetId }),
+            productReviews.deleteMany({ customerId: targetId }),
+        ]);
+        const result = await users.deleteOne(filter);
+        if (!result.deletedCount) return res.status(404).json({ message: "User not found." });
+        return res.status(200).json({ message: "User removed. Existing order records were kept for history." });
+    } catch (err) {
+        console.error("Failed to remove user:", err);
+        return res.status(500).json({ message: "Failed to remove user." });
     }
 });
 
