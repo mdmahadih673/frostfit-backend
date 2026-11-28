@@ -60,6 +60,12 @@ function isValidAddress(address) {
         && address.note.length <= 500;
 }
 
+function profileUserFilter(customerId) {
+    const alternatives = [{ _id: customerId }, { id: customerId }];
+    if (ObjectId.isValid(customerId)) alternatives.unshift({ _id: new ObjectId(customerId) });
+    return { $or: alternatives };
+}
+
 function escapeRegex(value) {
     return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -264,6 +270,66 @@ app.delete("/customer-addresses/:addressId", requireCustomerId, async (req, res)
     } catch (err) {
         console.error("Failed to remove customer address:", err);
         return res.status(500).json({ message: "Failed to remove address." });
+    }
+});
+
+// Customer profile. Email and role are read-only; name, phone, and image can be updated.
+app.get("/api/customer/profile", requireCustomerId, async (req, res) => {
+    try {
+        const user = await users.findOne(profileUserFilter(req.customerId), {
+            projection: { name: 1, email: 1, image: 1, phone: 1, emailVerified: 1, role: 1 },
+        });
+        if (!user) return res.status(404).json({ message: "Customer profile not found." });
+        return res.status(200).json({
+            profile: {
+                customerId: req.customerId,
+                name: String(user.name ?? ""),
+                email: String(user.email ?? ""),
+                phone: String(user.phone ?? ""),
+                image: typeof user.image === "string" ? user.image : "",
+                emailVerified: user.emailVerified === true,
+                role: String(user.role ?? "customer"),
+            },
+        });
+    } catch (err) {
+        console.error("Failed to load customer profile:", err);
+        return res.status(500).json({ message: "Failed to load profile." });
+    }
+});
+
+app.patch("/api/customer/profile", requireCustomerId, async (req, res) => {
+    const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+    const phone = typeof req.body?.phone === "string" ? req.body.phone.trim() : "";
+    const image = typeof req.body?.image === "string" ? req.body.image.trim() : "";
+    if (name.length < 2 || name.length > 100) {
+        return res.status(400).json({ message: "Name must be between 2 and 100 characters." });
+    }
+    if (!phone || phone.length > 40) {
+        return res.status(400).json({ message: "Enter a phone number no longer than 40 characters." });
+    }
+    if (image.length > 2048) {
+        return res.status(400).json({ message: "Profile image URL is too long." });
+    }
+    if (image) {
+        try {
+            const imageUrl = new URL(image);
+            if (!["http:", "https:"].includes(imageUrl.protocol)) throw new Error("Unsupported protocol");
+        } catch {
+            return res.status(400).json({ message: "Profile image must be a valid http or https URL." });
+        }
+    }
+
+    try {
+        const filter = profileUserFilter(req.customerId);
+        const user = await users.findOne(filter, { projection: { _id: 1 } });
+        if (!user) return res.status(404).json({ message: "Customer profile not found." });
+        await users.updateOne(filter, {
+            $set: { name, phone, image, updatedAt: new Date() },
+        });
+        return res.status(200).json({ message: "Profile updated successfully." });
+    } catch (err) {
+        console.error("Failed to update customer profile:", err);
+        return res.status(500).json({ message: "Failed to update profile." });
     }
 });
 
