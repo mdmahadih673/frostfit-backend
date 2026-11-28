@@ -27,6 +27,7 @@ const database = connectedClient.db("frostfit");
 const users = database.collection("user");
 const sellerProducts = database.collection("sellerProducts");
 const customerOrders = database.collection("customerOrders");
+const productReviews = database.collection("productReviews");
 const customerAddresses = database.collection("customerAddresses");
 const customerSavedItems = database.collection("customerSavedItems");
 
@@ -536,6 +537,7 @@ app.get("/api/seller/orders", async (req, res) => {
                 totalAmount: items.reduce((sum, item) => sum + Number(item.unitPrice ?? 0) * Number(item.quantity ?? 1), 0),
                 status: String(order.status ?? "pending"),
                 trackingUrl: typeof order.trackingUrl === "string" ? order.trackingUrl : "",
+                returnRequest: order.returnRequest ?? null,
                 createdAt: order.createdAt,
                 paymentMethod: String(order.paymentMethod ?? ""),
                 shippingAddress: order.shippingAddress ?? null,
@@ -551,10 +553,11 @@ app.get("/api/seller/orders", async (req, res) => {
 app.patch("/api/seller/orders", async (req, res) => {
     const sellerId = req.get("x-seller-id")?.trim();
     if (!sellerId) return res.status(401).json({ message: "Seller ID required." });
-    const { orderId, status, trackingUrl } = req.body ?? {};
+    const { orderId, status, trackingUrl, returnStatus } = req.body ?? {};
     if (typeof orderId !== "string" || !ObjectId.isValid(orderId)) return res.status(400).json({ message: "A valid orderId is required." });
-    if (status !== undefined && status !== "confirmed" && status !== "rejected") return res.status(400).json({ message: "Status must be confirmed or rejected." });
-    if (status === undefined && trackingUrl === undefined) return res.status(400).json({ message: "Provide a status or tracking link to update." });
+    if (status !== undefined && !["confirmed", "rejected", "delivered"].includes(status)) return res.status(400).json({ message: "Status must be confirmed, rejected, or delivered." });
+    if (returnStatus !== undefined && !["approved", "rejected", "refunded"].includes(returnStatus)) return res.status(400).json({ message: "Return status must be approved, rejected, or refunded." });
+    if (status === undefined && trackingUrl === undefined && returnStatus === undefined) return res.status(400).json({ message: "Provide an order update." });
 
     let normalizedTrackingUrl;
     if (trackingUrl !== undefined) {
@@ -575,22 +578,28 @@ app.patch("/api/seller/orders", async (req, res) => {
         const sellerItems = await sellerProducts.find({ sellerId }, { projection: { _id: 1 } }).toArray();
         const productIds = sellerItems.map(({ _id }) => String(_id));
         if (!productIds.length) return res.status(404).json({ message: "No products found for this seller." });
+        const allowedCurrentStatuses = status === "delivered" ? ["confirmed"] : status ? ["pending", "new"] : null;
         const filter = {
             _id: new ObjectId(orderId),
-            status: status === undefined ? { $ne: "rejected" } : { $in: ["pending", "new"] },
+            status: allowedCurrentStatuses ? { $in: allowedCurrentStatuses } : { $ne: "rejected" },
             "items.productId": { $in: productIds },
         };
         const setFields = { updatedAt: new Date() };
         if (status !== undefined) setFields.status = status;
+        if (returnStatus !== undefined) {
+            setFields["returnRequest.status"] = returnStatus;
+            setFields["returnRequest.updatedAt"] = new Date();
+        }
         if (typeof normalizedTrackingUrl === "string") setFields.trackingUrl = normalizedTrackingUrl;
+        const filterWithReturn = returnStatus === undefined ? filter : { ...filter, "returnRequest.status": "requested" };
         const update = { $set: setFields };
         if (normalizedTrackingUrl === null) update.$unset = { trackingUrl: "" };
-        const result = await customerOrders.updateOne(filter, update);
+        const result = await customerOrders.updateOne(filterWithReturn, update);
         if (!result.matchedCount) {
             const exists = await customerOrders.findOne({ _id: new ObjectId(orderId), "items.productId": { $in: productIds } });
             return res.status(exists ? 409 : 404).json({ message: exists ? "This order has already been processed." : "Order not found for your products." });
         }
-        return res.status(200).json({ message: status === undefined ? "Tracking link saved." : "Order updated.", status, trackingUrl: normalizedTrackingUrl ?? null });
+        return res.status(200).json({ message: returnStatus ? "Return request updated." : status === undefined ? "Tracking link saved." : "Order updated.", status, returnStatus, trackingUrl: normalizedTrackingUrl ?? null });
     } catch (err) {
         console.error("Failed to update seller order:", err);
         return res.status(500).json({ message: "Failed to update order status." });
@@ -706,14 +715,56 @@ app.post("/api/orders", requireCustomerId, async (req, res) => {
     }
 });
 
+// Product reviews are public to read; only customers with a delivered order can write one.
+app.get("/api/products/:productId/reviews", async (req, res) => {
+    if (!ObjectId.isValid(req.params.productId)) return res.status(400).json({ message: "A valid productId is required." });
+    try {
+        const reviews = await productReviews.find({ productId: req.params.productId }).sort({ updatedAt: -1 }).toArray();
+        const averageRating = reviews.length ? reviews.reduce((sum, review) => sum + review.rating, 0) / reviews.length : 0;
+        return res.status(200).json({ reviews: reviews.map((review) => ({ ...review, _id: String(review._id) })), averageRating, reviewCount: reviews.length });
+    } catch (err) {
+        console.error("Failed to fetch product reviews:", err);
+        return res.status(500).json({ message: "Failed to load product reviews." });
+    }
+});
+
+app.post("/api/products/:productId/reviews", requireCustomerId, async (req, res) => {
+    const { rating, comment } = req.body ?? {};
+    if (!ObjectId.isValid(req.params.productId)) return res.status(400).json({ message: "A valid productId is required." });
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) return res.status(400).json({ message: "Rating must be between 1 and 5." });
+    if (typeof comment !== "string" || comment.trim().length < 3 || comment.trim().length > 1500) return res.status(400).json({ message: "Review must be between 3 and 1500 characters." });
+    try {
+        const purchased = await customerOrders.findOne({ $or: [{ customerId: req.customerId }, { userId: req.customerId }], status: { $in: ["delivered", "completed"] }, "items.productId": req.params.productId });
+        if (!purchased) return res.status(403).json({ message: "A delivered order is required to review this product." });
+        const now = new Date();
+        const review = { productId: req.params.productId, customerId: req.customerId, customerName: String(purchased.customerName ?? "Customer"), rating, comment: comment.trim(), updatedAt: now };
+        await productReviews.updateOne({ productId: req.params.productId, customerId: req.customerId }, { $set: review, $setOnInsert: { createdAt: now } }, { upsert: true });
+        const saved = await productReviews.findOne({ productId: req.params.productId, customerId: req.customerId });
+        return res.status(200).json({ review: { ...saved, _id: String(saved._id) } });
+    } catch (err) {
+        console.error("Failed to save product review:", err);
+        return res.status(500).json({ message: "Failed to save product review." });
+    }
+});
+
 // PATCH /api/orders/:orderId - Cancel an order
 app.patch("/api/orders/:orderId", requireCustomerId, async (req, res) => {
     const orderId = req.params.orderId;
     const body = req.body ?? {};
     const status = typeof body.status === "string" ? body.status.trim() : "";
-
-    if (!ObjectId.isValid(orderId)) {
-        return res.status(400).json({ message: "A valid orderId is required." });
+    if (!ObjectId.isValid(orderId)) return res.status(400).json({ message: "A valid orderId is required." });
+    if (body.action === "request-return") {
+        const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+        if (reason.length < 3 || reason.length > 300) return res.status(400).json({ message: "Please provide a reason (3–300 characters)." });
+        try {
+            const filter = { _id: new ObjectId(orderId), $or: [{ customerId: req.customerId }, { userId: req.customerId }], status: { $in: ["delivered", "completed"] }, returnRequest: { $exists: false } };
+            const result = await customerOrders.updateOne(filter, { $set: { returnRequest: { status: "requested", reason, requestedAt: new Date(), updatedAt: new Date() }, updatedAt: new Date() } });
+            if (!result.modifiedCount) return res.status(409).json({ message: "A return request is only available for delivered orders without an existing request." });
+            return res.status(200).json({ message: "Return/refund request submitted." });
+        } catch (err) {
+            console.error("Failed to request return:", err);
+            return res.status(500).json({ message: "Failed to submit return request." });
+        }
     }
 
     if (status !== "cancelled") {
